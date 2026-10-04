@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------
+# NAIVE Dockerfile - what NOT to do (kept here for comparison)
+# ---------------------------------------------------------------
+# Problems:
+#  1. Full "node:22" base image (Debian + build tools, ~1 GB)
+#  2. Source copied BEFORE installing deps -> every code change
+#     invalidates the npm install cache layer
+#  3. Installs devDependencies into the production image
+#  4. Runs as root
+#  5. No .dockerignore awareness, no healthcheck
+# ---------------------------------------------------------------
+FROM node:22
+
+WORKDIR /app
+
+COPY app/ .
+
+RUN npm install
+
+EXPOSE 3000
+
+CMD ["npm", "start"]

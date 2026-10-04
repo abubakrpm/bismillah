@@ -1,0 +1,16 @@
+{
+  "name": "docker-image-optimizer",
+  "version": "1.0.0",
+  "description": "Demo app comparing a naive Docker image with an optimized multi-stage image",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0"
+  }
+}
