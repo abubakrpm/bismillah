@@ -1,0 +1,184 @@
+# Fail-fast CI/CD pipeline
+# Stages are ordered cheapest -> most expensive. Each stage only runs
+# if everything before it passed, so broken code fails in seconds.
+#
+#   lint ─┬─ unit-tests ──┬─ build ─ image-scan ─ integration ─ staging ─ production
+#         └─ security ────┘                                              (manual gate)
+
+name: pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel older runs on the same branch when a new commit is pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ---------------- Stage 1: seconds ----------------
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "check ."
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "format --check ."
+
+  # ---------------- Stage 2: parallel fast checks ----------------
+  unit-tests:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest tests/test_unit.py -v
+
+  security:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so secret scanning sees every commit
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: SAST (bandit) - blocking on medium+ severity
+        run: |
+          pip install bandit==1.8.3
+          bandit -r app/ --severity-level medium
+
+  # ---------------- Stage 3: build with layer cache ----------------
+  build:
+    needs: [unit-tests, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (cached via GitHub Actions cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Save image for later stages
+        run: docker save ${{ env.IMAGE }}:${{ github.sha }} -o image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+
+  # ---------------- Stage 4: block on critical CVEs ----------------
+  image-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: docker load -i image.tar
+      - name: Trivy scan (fails on HIGH/CRITICAL with a fix available)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ---------------- Stage 5: expensive, real container ----------------
+  integration:
+    needs: image-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: docker load -i image.tar
+      - name: Start container
+        run: |
+          docker run -d --name app -p 8000:8000 ${{ env.IMAGE }}:${{ github.sha }}
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:8000/health && exit 0
+            sleep 1
+          done
+          echo "Container never became healthy"; docker logs app; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest tests/test_integration.py -v
+        env:
+          APP_URL: http://localhost:8000
+      - if: failure()
+        run: docker logs app
+
+  # ---------------- Stage 6: deploy (main branch only) ----------------
+  deploy-staging:
+    needs: integration
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: docker load -i image.tar
+      - name: Push image to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+      - name: Deploy to staging
+        run: |
+          echo "Deploying ${{ env.IMAGE }}:${{ github.sha }} to staging"
+          # Replace with your real deploy, e.g.:
+          # kubectl set image deployment/app app=${{ env.IMAGE }}:${{ github.sha }} -n staging
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    # Add "Required reviewers" to the production environment in
+    # Settings -> Environments to turn this into a manual approval gate
+    environment: production
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "Deploying ${{ env.IMAGE }}:${{ github.sha }} to production"
+          # kubectl set image deployment/app app=${{ env.IMAGE }}:${{ github.sha }} -n production
